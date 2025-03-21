@@ -1,0 +1,15 @@
+Token Configuration
+Admin Token:
+Policy ID: dd3314723ac41eb2d91e4b695869ff5597f0f0acea9f063d4adb60d5
+Token Name: 617374657269612d61646d696e
+
+Shipyard Policy:
+Policy ID: a6c2c9684eab662549c6417aea6724b238591e38cdddaabd43086ef3
+
+Prize Tokens:
+Max UTXOs with Prizes
+25
+Max Tokens per UTXO: 1
+Policy ID: 5e74a87d8109db21fe3d407950c161cd2df7975f0868e10682a3dbfe
+Token Name: Plutus PBL 2024 Scaffold Token
+Quantity: 1
