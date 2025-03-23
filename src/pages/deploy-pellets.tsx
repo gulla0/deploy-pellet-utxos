@@ -2,7 +2,8 @@
 import Head from "next/head";
 import { useRef, useState, ChangeEvent, useEffect } from "react";
 import { CardanoWallet, useWallet } from "@meshsdk/react";
-import { Transaction, ForgeScript, Asset, Data, PlutusScript, MeshTxBuilder, stringToHex } from "@meshsdk/core";
+import { Transaction, ForgeScript, Asset, Data, PlutusScript, MeshTxBuilder, stringToHex, BlockfrostProvider } from "@meshsdk/core";
+import { CustomMeshTxBuilder } from "@/lib/CustomMeshTxBuilder";
 import {
   PelletParams,
   parsePelletsCSV,
@@ -31,7 +32,14 @@ export type PrizeTokenConfig = {
 };
 
 const PELLET_REF_TX_HASH = "d2aad1327c66dc18ef0e31755195dce708dd13ceb22ff5e7350662512cee983f";
-const PELLET_REF_OUTPUT_INDEX = 1;
+const PELLET_REF_OUTPUT_INDEX = 0;
+
+// Add this environment variable access for Blockfrost API key 
+// It will be replaced with your actual API key in .env.local
+const BLOCKFROST_API_KEY = process.env.NEXT_PUBLIC_BLOCKFROST_API_KEY || '';
+
+// Add this constant for the pre-prod network ID
+const NETWORK_ID = 2; // 0 = mainnet, 1 = preview/testnet, 2 = pre-prod
 
 export default function DeployPellets() {
   const { connected, wallet } = useWallet();
@@ -172,7 +180,60 @@ export default function DeployPellets() {
   // Add checkWalletBalances function
   const checkWalletBalances = async () => {
     try {
-      const utxos = await wallet.getUtxos();
+      // First try to use getBalance API as it's more direct
+      try {
+        const balance = await wallet.getBalance();
+        console.log('Wallet balance from getBalance API:', balance);
+        
+        const balances: { [key: string]: bigint } = {};
+        
+        // Process each asset from the balance response
+        for (const asset of balance) {
+          const unit = asset.unit;
+          const quantity = BigInt(asset.quantity);
+          
+          // Store the balance in both formats - with and without dot separator
+          balances[unit] = quantity;
+          
+          // If this is a native token (not lovelace), also store it in dot notation format
+          if (unit !== 'lovelace' && unit.length > 56) {
+            const policyId = unit.slice(0, 56);
+            const assetName = unit.slice(56);
+            const dotNotation = `${policyId}.${assetName}`;
+            balances[dotNotation] = quantity;
+            
+            // Also store in lowercase for more robust matching
+            balances[unit.toLowerCase()] = quantity;
+            balances[dotNotation.toLowerCase()] = quantity;
+          }
+        }
+        
+        setWalletBalances(balances);
+        console.log('Processed wallet balances (both formats):', balances);
+        return;
+      } catch (balanceError) {
+        console.warn('Error using getBalance API, falling back to getUtxos:', balanceError);
+      }
+      
+      // Fallback to getUtxos if getBalance fails
+      // Wrap in a promise with timeout to ensure completion
+      const utxosPromise = new Promise<any[]>(async (resolve, reject) => {
+        try {
+          const utxos = await wallet.getUtxos();
+          resolve(utxos);
+        } catch (error) {
+          reject(error);
+        }
+      });
+      
+      // Set a timeout to ensure we don't wait forever
+      const timeoutPromise = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error('Timeout getting UTXOs')), 10000);
+      });
+      
+      // Race the promises to handle potential WebAssembly issues
+      const utxos = await Promise.race([utxosPromise, timeoutPromise]) as any[];
+      
       const balances: { [key: string]: bigint } = {};
       
       for (const utxo of utxos) {
@@ -180,11 +241,22 @@ export default function DeployPellets() {
         for (const asset of utxo.output.amount) {
           const unit = asset.unit;
           const quantity = BigInt(asset.quantity);
+          
+          // Store the balance in both formats - with and without dot separator
           balances[unit] = (balances[unit] || BigInt(0)) + quantity;
+          
+          // If this is a native token (not lovelace), also store it in dot notation format
+          if (unit !== 'lovelace' && unit.length > 56) {
+            const policyId = unit.slice(0, 56);
+            const assetName = unit.slice(56);
+            const dotNotation = `${policyId}.${assetName}`;
+            balances[dotNotation] = (balances[dotNotation] || BigInt(0)) + quantity;
+          }
         }
       }
       
       setWalletBalances(balances);
+      console.log('Wallet balances from UTXOs (both formats):', balances);
     } catch (error) {
       console.error('Error checking wallet balances:', error);
     }
@@ -194,16 +266,26 @@ export default function DeployPellets() {
   const calculateRequiredTokens = () => {
     if (pellets.length === 0) return null;
     
+    // Normalize policy and name to prevent case sensitivity issues
+    const normalizedPolicy = adminTokenPolicy.trim();
+    const normalizedName = adminTokenName.trim();
+    
     const required: { [key: string]: bigint } = {
       lovelace: BigInt(2000000) * BigInt(pellets.length), // 2 ADA per pellet
-      [`${adminTokenPolicy}.${adminTokenName}`]: BigInt(pellets.length) // 1 admin token per pellet
+      [`${normalizedPolicy}.${normalizedName}`]: BigInt(pellets.length) // 1 admin token per pellet
     };
     
     // Add prize tokens
     prizeTokens.forEach(token => {
-      const unit = `${token.policy}.${token.name}`;
+      const normalizedTokenPolicy = token.policy.trim();
+      const normalizedTokenName = token.name.trim(); 
+      const unit = `${normalizedTokenPolicy}.${normalizedTokenName}`;
       required[unit] = BigInt(token.quantity) * BigInt(pellets.length);
     });
+    
+    console.log('Required tokens with dot notation:', required);
+    console.log('Admin token policy:', normalizedPolicy);
+    console.log('Admin token name:', normalizedName);
     
     return required;
   };
@@ -246,11 +328,70 @@ export default function DeployPellets() {
 
     // Check if we have enough tokens
     for (const [unit, required] of Object.entries(requiredTokens)) {
+      // Normalize the keys for comparison
+      const normalizedUnit = unit.toLowerCase().trim();
+      
+      // Debug output to see all keys
+      console.log('All wallet balance keys:', Object.keys(walletBalances).join(', '));
+      
+      // First check exact match
       const balance = walletBalances[unit] || BigInt(0);
-      if (balance < required) {
-        setDeploymentStatus(`Insufficient balance for ${unit}. Required: ${required}, Available: ${balance}`);
-        return;
+      console.log(`Checking token unit ${unit}: Required=${required}, Available=${balance}`);
+      
+      if (balance >= required) {
+        continue; // We have enough tokens in this format
       }
+      
+      // Check normalized version
+      const normalizedBalance = walletBalances[normalizedUnit] || BigInt(0);
+      console.log(`Checking normalized token unit ${normalizedUnit}: Available=${normalizedBalance}`);
+      
+      if (normalizedBalance >= required) {
+        console.log(`Found sufficient balance using normalized format!`);
+        continue; // Skip this check if we have enough tokens in normalized format
+      }
+      
+      // Try alternative format without dot
+      const altUnit = unit.replace('.', '');
+      const altBalance = walletBalances[altUnit] || BigInt(0);
+      console.log(`Checking alternative format ${altUnit}: Available=${altBalance}`);
+      
+      // Also try normalized alt format
+      const normalizedAltUnit = altUnit.toLowerCase().trim();
+      const normalizedAltBalance = walletBalances[normalizedAltUnit] || BigInt(0);
+      console.log(`Checking normalized alternative format ${normalizedAltUnit}: Available=${normalizedAltBalance}`);
+      
+      // Check if any token in wallet contains the policy ID
+      const policyId = adminTokenPolicy.toLowerCase().trim();
+      const tokenName = adminTokenName.toLowerCase().trim();
+      
+      console.log(`Looking for any token with policy ${policyId} and name ${tokenName}`);
+      let found = false;
+      
+      // Try to find a matching token with fuzzy matching
+      for (const [walletKey, walletValue] of Object.entries(walletBalances)) {
+        if (walletKey !== 'lovelace' && walletValue >= required) {
+          const keyLower = walletKey.toLowerCase();
+          if (keyLower.includes(policyId) && keyLower.includes(tokenName)) {
+            console.log(`Found matching token: ${walletKey} with balance ${walletValue}`);
+            found = true;
+            break;
+          }
+        }
+      }
+      
+      if (found) {
+        console.log(`Found token with fuzzy matching!`);
+        continue;
+      }
+      
+      if (altBalance >= required || normalizedAltBalance >= required) {
+        console.log(`Found sufficient balance using alternative format!`);
+        continue; // Skip this check if we have enough tokens in alt format
+      }
+      
+      setDeploymentStatus(`Insufficient balance for ${unit}. Required: ${required}, Available: ${balance}`);
+      return;
     }
 
     setIsDeploying(true);
@@ -270,7 +411,7 @@ export default function DeployPellets() {
       const utxos = await wallet.getUtxos();
 
       // Admin token unit
-      const adminTokenUnit = `${adminTokenPolicy}.${adminTokenName}`;
+      const adminTokenUnit = `${adminTokenPolicy.trim()}.${adminTokenName.trim()}`;
 
       // Track remaining prize tokens and UTXOs
       let remainingPrizeUtxos = maxPrizeUtxos;
@@ -281,93 +422,106 @@ export default function DeployPellets() {
         const batch = batches[i];
         setDeploymentStatus(`Deploying batch ${i + 1} of ${batches.length}...`);
 
-        // Create the transaction for this batch
-        const tx = new MeshTxBuilder();
-
-        // Extract policy ID from validator address
-        const validatorScriptHash = validatorAddress.slice(0, 56);
-
-        // Add outputs for each pellet in the batch
-        for (const pellet of batch) {
-          // Prepare the datum for this pellet
-          const pelletDatum = {
-            alternative: 0,
-            fields: [
-              pellet.pos_x.toString(),
-              pellet.pos_y.toString(),
-              pellet.shipyard_policy || shipyardPolicy
-            ]
-          };
-          
-          // Create base assets for this pellet
-          const assets: Asset[] = [
-            { unit: "lovelace", quantity: "2000000" },
-            { unit: adminTokenUnit, quantity: "1" }
-          ];
-
-          // Randomly assign prize tokens if available
-          if (remainingPrizeUtxos > 0) {
-            const shouldGetPrize = Math.random() < (remainingPrizeUtxos / remainingPellets);
-            if (shouldGetPrize) {
-              prizeTokens.forEach(token => {
-                const unit = `${token.policy}.${token.name}`;
-                const availableBalance = walletBalances[unit] || BigInt(0);
-                if (availableBalance > BigInt(0)) {
-                  const tokensToAssign = Math.min(
-                    Number(availableBalance),
-                    maxTokensPerUtxo
-                  );
-                  assets.push({
-                    unit,
-                    quantity: tokensToAssign.toString()
-                  });
-                }
-              });
-              remainingPrizeUtxos--;
-            }
-          }
-          remainingPellets--;
-
-          // Mint fuel tokens using the validator script as the minting policy
-          const fuelTokenHex = stringToHex("fuel");
-          tx.mintPlutusScriptV2()
-            .mint(pellet.fuel.toString(), validatorScriptHash, fuelTokenHex)
-            .mintTxInReference(PELLET_REF_TX_HASH, PELLET_REF_OUTPUT_INDEX)
-            .mintRedeemerValue({
-              alternative: 0, // MintFuel constructor
-              fields: []
-            }, "JSON");
-
-          // Add the minted fuel token to assets
-          assets.push({
-            unit: `${validatorScriptHash}.${fuelTokenHex}`,
-            quantity: pellet.fuel.toString()
+        try {
+          // Create the transaction for this batch with our custom builder
+          const tx = new CustomMeshTxBuilder({
+            // No need to specify the Blockfrost provider here, our CustomMeshTxBuilder handles it
           });
+
+          // Extract policy ID from validator address
+          const validatorScriptHash = validatorAddress.slice(0, 56);
+
+          // Add outputs for each pellet in the batch
+          for (const pellet of batch) {
+            // Prepare the datum for this pellet
+            const pelletDatum = {
+              alternative: 0,
+              fields: [
+                pellet.pos_x.toString(),
+                pellet.pos_y.toString(),
+                pellet.shipyard_policy || shipyardPolicy
+              ]
+            };
+            
+            // Create base assets for this pellet
+            const assets: Asset[] = [
+              { unit: "lovelace", quantity: "2000000" },
+              { unit: adminTokenUnit, quantity: "1" }
+            ];
+
+            // Randomly assign prize tokens if available
+            if (remainingPrizeUtxos > 0) {
+              const shouldGetPrize = Math.random() < (remainingPrizeUtxos / remainingPellets);
+              if (shouldGetPrize) {
+                prizeTokens.forEach(token => {
+                  const unit = `${token.policy}.${token.name}`;
+                  const availableBalance = walletBalances[unit] || BigInt(0);
+                  if (availableBalance > BigInt(0)) {
+                    const tokensToAssign = Math.min(
+                      Number(availableBalance),
+                      maxTokensPerUtxo
+                    );
+                    assets.push({
+                      unit,
+                      quantity: tokensToAssign.toString()
+                    });
+                  }
+                });
+                remainingPrizeUtxos--;
+              }
+            }
+            remainingPellets--;
+
+            // Mint fuel tokens using the validator script as the minting policy
+            const fuelTokenHex = stringToHex("FUEL");
+            tx.mintPlutusScriptV2()
+              .mint(pellet.fuel.toString(), validatorScriptHash, fuelTokenHex)
+              .mintTxInReference(PELLET_REF_TX_HASH, PELLET_REF_OUTPUT_INDEX)
+              .mintRedeemerValue({
+                alternative: 0, // MintFuel constructor
+                fields: []
+              }, "JSON");
+
+            // Add the minted fuel token to assets
+            assets.push({
+              unit: `${validatorScriptHash}.${fuelTokenHex}`,
+              quantity: pellet.fuel.toString()
+            });
+            
+            // Send assets to the validator address with inline datum
+            tx.txOut(validatorAddress, assets)
+              .txOutInlineDatumValue(pelletDatum);
+          }
+
+          // Add collateral
+          tx.txInCollateral(
+            collateral.input.txHash,
+            collateral.input.outputIndex,
+            collateral.output.amount,
+            collateral.output.address
+          );
+
+          // Set change address and select UTXOs
+          tx.changeAddress(changeAddress)
+            .selectUtxosFrom(utxos);
+
+          // Complete and submit the transaction
+          const unsignedTx = await tx.complete();
+          const signedTx = await wallet.signTx(unsignedTx, true); // true to sign with collateral
+          const txHash = await wallet.submitTx(signedTx);
+
+          txHashesResult.push(txHash);
+          setDeploymentStatus(`Deployed batch ${i + 1} of ${batches.length}. Transaction: ${txHash}`);
+        } catch (batchError) {
+          console.error(`Error processing batch ${i + 1}:`, batchError);
+          setDeploymentStatus(`Error processing batch ${i + 1}: ${batchError instanceof Error ? batchError.message : String(batchError)}`);
           
-          // Send assets to the validator address with inline datum
-          tx.txOut(validatorAddress, assets)
-            .txOutInlineDatumValue(pelletDatum);
+          // Decide whether to continue with next batch or stop
+          const confirmContinue = window.confirm(`Error in batch ${i + 1}. Continue with next batch?`);
+          if (!confirmContinue) {
+            break;
+          }
         }
-
-        // Add collateral
-        tx.txInCollateral(
-          collateral.input.txHash,
-          collateral.input.outputIndex,
-          collateral.output.amount,
-          collateral.output.address
-        );
-
-        // Set change address and select UTXOs
-        tx.changeAddress(changeAddress)
-          .selectUtxosFrom(utxos);
-
-        // Complete and submit the transaction
-        const unsignedTx = await tx.complete();
-        const signedTx = await wallet.signTx(unsignedTx, true); // true to sign with collateral
-        const txHash = await wallet.submitTx(signedTx);
-
-        txHashesResult.push(txHash);
-        setDeploymentStatus(`Deployed batch ${i + 1} of ${batches.length}. Transaction: ${txHash}`);
       }
 
       setTxHashes(txHashesResult);

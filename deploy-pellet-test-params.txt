@@ -11,5 +11,5 @@ Max UTXOs with Prizes
 25
 Max Tokens per UTXO: 1
 Policy ID: 5e74a87d8109db21fe3d407950c161cd2df7975f0868e10682a3dbfe
-Token Name: Plutus PBL 2024 Scaffold Token
+Token Name: 7070626c323032342d73636166666f6c642d746f6b656e
 Quantity: 1

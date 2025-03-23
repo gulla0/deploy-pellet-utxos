@@ -11,6 +11,7 @@
     "lint": "next lint"
   },
   "dependencies": {
+    "@blockfrost/blockfrost-js": "^6.0.0",
     "@meshsdk/core": "1.7.30",
     "@meshsdk/react": "1.7.30",
     "next": "15.0.3",

@@ -3,9 +3,20 @@ const nextConfig = {
   webpack: (config) => {
     config.experiments = {
       ...config.experiments,
-      asyncWebAssembly: true
+      asyncWebAssembly: true,
+      topLevelAwait: true,
     }
     return config
+  },
+  // Add redirects for the root path
+  async redirects() {
+    return [
+      {
+        source: '/',
+        destination: '/deploy-pellets',
+        permanent: true,
+      },
+    ]
   }
 }
 
