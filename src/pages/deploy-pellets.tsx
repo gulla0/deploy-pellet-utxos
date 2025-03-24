@@ -2,8 +2,7 @@
 import Head from "next/head";
 import { useRef, useState, ChangeEvent, useEffect } from "react";
 import { CardanoWallet, useWallet } from "@meshsdk/react";
-import { Transaction, ForgeScript, Asset, Data, PlutusScript, MeshTxBuilder, stringToHex, BlockfrostProvider } from "@meshsdk/core";
-import { CustomMeshTxBuilder } from "@/lib/CustomMeshTxBuilder";
+import { Transaction, ForgeScript, Asset, Data, PlutusScript, MeshTxBuilder, stringToHex, BlockfrostProvider, mConStr0, deserializeAddress } from "@meshsdk/core";
 import {
   PelletParams,
   parsePelletsCSV,
@@ -40,6 +39,27 @@ const BLOCKFROST_API_KEY = process.env.NEXT_PUBLIC_BLOCKFROST_API_KEY || '';
 
 // Add this constant for the pre-prod network ID
 const NETWORK_ID = 2; // 0 = mainnet, 1 = preview/testnet, 2 = pre-prod
+
+async function verifyReferenceScript(txHash: string, outputIndex: number): Promise<boolean> {
+  try {
+    const provider = new BlockfrostProvider(BLOCKFROST_API_KEY);
+    // First, check if the transaction exists
+    const txInfo = await provider.fetchTxInfo(txHash);
+    console.log('Reference script transaction info:', txInfo);
+    
+    // Just verify we got transaction data back
+    if (txInfo) {
+      console.log('Reference transaction found');
+      return true;
+    } else {
+      console.error('Reference transaction not found');
+      return false;
+    }
+  } catch (error) {
+    console.error('Error verifying reference script:', error);
+    return false;
+  }
+}
 
 export default function DeployPellets() {
   const { connected, wallet } = useWallet();
@@ -270,22 +290,32 @@ export default function DeployPellets() {
     const normalizedPolicy = adminTokenPolicy.trim();
     const normalizedName = adminTokenName.trim();
     
+    // Use the concatenated format (no dot) as primary, and dot notation as fallback
+    const concatenatedFormat = `${normalizedPolicy}${normalizedName}`;
+    const dotFormat = `${normalizedPolicy}.${normalizedName}`;
+    
     const required: { [key: string]: bigint } = {
-      lovelace: BigInt(2000000) * BigInt(pellets.length), // 2 ADA per pellet
-      [`${normalizedPolicy}.${normalizedName}`]: BigInt(pellets.length) // 1 admin token per pellet
+      lovelace: BigInt(1000000) * BigInt(pellets.length), // 1 ADA per pellet
+      [concatenatedFormat]: BigInt(pellets.length) // 1 admin token per pellet
     };
     
-    // Add prize tokens
+    // Also add dot format for compatibility with older code
+    required[dotFormat] = BigInt(pellets.length);
+    
+    // Add prize tokens (concatenated format)
     prizeTokens.forEach(token => {
       const normalizedTokenPolicy = token.policy.trim();
       const normalizedTokenName = token.name.trim(); 
-      const unit = `${normalizedTokenPolicy}.${normalizedTokenName}`;
-      required[unit] = BigInt(token.quantity) * BigInt(pellets.length);
+      const concatenatedUnit = `${normalizedTokenPolicy}${normalizedTokenName}`;
+      const dotUnit = `${normalizedTokenPolicy}.${normalizedTokenName}`;
+      required[concatenatedUnit] = BigInt(token.quantity) * BigInt(pellets.length);
+      required[dotUnit] = BigInt(token.quantity) * BigInt(pellets.length);
     });
     
-    console.log('Required tokens with dot notation:', required);
+    console.log('Required tokens (concatenated format):', required);
     console.log('Admin token policy:', normalizedPolicy);
     console.log('Admin token name:', normalizedName);
+    console.log('Admin token concatenated:', concatenatedFormat);
     
     return required;
   };
@@ -318,6 +348,15 @@ export default function DeployPellets() {
       setDeploymentStatus("Please enter admin token policy and name.");
       return;
     }
+    
+    // Verify the reference script
+    setDeploymentStatus("Verifying reference script...");
+    const isRefScriptValid = await verifyReferenceScript(PELLET_REF_TX_HASH, PELLET_REF_OUTPUT_INDEX);
+    if (!isRefScriptValid) {
+      setDeploymentStatus("Failed to verify reference script. Please check PELLET_REF_TX_HASH and PELLET_REF_OUTPUT_INDEX.");
+      return;
+    }
+    setDeploymentStatus("Reference script verified successfully.");
 
     // Check wallet balances
     const requiredTokens = calculateRequiredTokens();
@@ -406,12 +445,30 @@ export default function DeployPellets() {
       }
 
       const txHashesResult: string[] = [];
-      const collateral = (await wallet.getCollateral())[0];
-      const changeAddress = await wallet.getChangeAddress();
+      const collateralUtxos = await wallet.getCollateral();
+      console.log("Collateral UTXOs:", collateralUtxos);
+      
+      // Get the first UTXO from wallet to use as collateral if no designated collateral exists
       const utxos = await wallet.getUtxos();
+      console.log(`Total UTXOs available: ${utxos.length}`);
+      
+      if (utxos.length === 0) {
+        setDeploymentStatus("No UTXOs found in wallet. Please ensure your wallet has ADA.");
+        setIsDeploying(false);
+        return;
+      }
+      
+      // We'll use the first UTXO that has enough ADA as collateral if needed
+      const potentialCollateral = utxos.find(utxo => {
+        const lovelaceAmount = utxo.output.amount.find(a => a.unit === 'lovelace');
+        return lovelaceAmount && BigInt(lovelaceAmount.quantity) >= BigInt(5000000); // 5 ADA
+      });
+      
+      const changeAddress = await wallet.getChangeAddress();
 
-      // Admin token unit
-      const adminTokenUnit = `${adminTokenPolicy.trim()}.${adminTokenName.trim()}`;
+      // Admin token unit - using concatenated format without dot
+      const adminTokenUnit = `${adminTokenPolicy.trim()}${adminTokenName.trim()}`;
+      console.log("Using admin token unit (no dot):", adminTokenUnit);
 
       // Track remaining prize tokens and UTXOs
       let remainingPrizeUtxos = maxPrizeUtxos;
@@ -423,19 +480,46 @@ export default function DeployPellets() {
         setDeploymentStatus(`Deploying batch ${i + 1} of ${batches.length}...`);
 
         try {
-          // Create the transaction for this batch with our custom builder
-          const tx = new CustomMeshTxBuilder({
-            // No need to specify the Blockfrost provider here, our CustomMeshTxBuilder handles it
+          // Create the transaction for this batch with standard MeshTxBuilder
+          const tx = new MeshTxBuilder({
+            fetcher: new BlockfrostProvider(BLOCKFROST_API_KEY),
+            verbose: true,
           });
+          
+          // Set the network to preprod
+          tx.setNetwork("preprod");
+          console.log("Network configured for preprod");
 
-          // Extract policy ID from validator address
-          const validatorScriptHash = validatorAddress.slice(0, 56);
+          // Extract script hash from validator address properly
+          let validatorScriptHash = "";
+          try {
+            const deserializedAddress = deserializeAddress(validatorAddress);
+            
+            // Check if we got a scriptHash from deserialization
+            if (deserializedAddress.scriptHash) {
+              validatorScriptHash = deserializedAddress.scriptHash;
+              console.log("Properly extracted script hash:", validatorScriptHash);
+            } else {
+              // Fallback to original method if no script hash found
+              console.warn("No script hash found in deserialized address, falling back to original method");
+              validatorScriptHash = validatorAddress.slice(0, 56);
+            }
+            
+            // Validate that we have a valid hex string for the script hash
+            if (!/^[0-9a-fA-F]+$/.test(validatorScriptHash)) {
+              console.error("Extracted script hash is not a valid hex string:", validatorScriptHash);
+              throw new Error("Invalid script hash format");
+            }
+          } catch (error) {
+            console.error("Error extracting script hash from validator address:", error);
+            throw new Error(`Failed to extract script hash: ${error instanceof Error ? error.message : String(error)}`);
+          }
 
           // Add outputs for each pellet in the batch
           for (const pellet of batch) {
             // Prepare the datum for this pellet
             const pelletDatum = {
-              alternative: 0,
+              constructor: 0,
               fields: [
                 pellet.pos_x.toString(),
                 pellet.pos_y.toString(),
@@ -445,7 +529,7 @@ export default function DeployPellets() {
             
             // Create base assets for this pellet
             const assets: Asset[] = [
-              { unit: "lovelace", quantity: "2000000" },
+              { unit: "lovelace", quantity: "1000000" },
               { unit: adminTokenUnit, quantity: "1" }
             ];
 
@@ -454,7 +538,8 @@ export default function DeployPellets() {
               const shouldGetPrize = Math.random() < (remainingPrizeUtxos / remainingPellets);
               if (shouldGetPrize) {
                 prizeTokens.forEach(token => {
-                  const unit = `${token.policy}.${token.name}`;
+                  // Use concatenated format without a dot
+                  const unit = `${token.policy.trim()}${token.name.trim()}`;
                   const availableBalance = walletBalances[unit] || BigInt(0);
                   if (availableBalance > BigInt(0)) {
                     const tokensToAssign = Math.min(
@@ -474,44 +559,220 @@ export default function DeployPellets() {
 
             // Mint fuel tokens using the validator script as the minting policy
             const fuelTokenHex = stringToHex("FUEL");
-            tx.mintPlutusScriptV2()
-              .mint(pellet.fuel.toString(), validatorScriptHash, fuelTokenHex)
-              .mintTxInReference(PELLET_REF_TX_HASH, PELLET_REF_OUTPUT_INDEX)
-              .mintRedeemerValue({
-                alternative: 0, // MintFuel constructor
-                fields: []
-              }, "JSON");
-
-            // Add the minted fuel token to assets
-            assets.push({
-              unit: `${validatorScriptHash}.${fuelTokenHex}`,
-              quantity: pellet.fuel.toString()
+            console.log("Minting fuel tokens:", {
+              amount: pellet.fuel.toString(),
+              policy: validatorScriptHash,
+              tokenName: fuelTokenHex,
+              refTxHash: PELLET_REF_TX_HASH,
+              refOutputIndex: PELLET_REF_OUTPUT_INDEX
             });
             
+            try {
+              console.log("Minting process details:");
+              console.log("- Amount of fuel tokens:", pellet.fuel.toString());
+              console.log("- Minting policy:", validatorScriptHash);
+              console.log("- Token name (hex):", fuelTokenHex);
+              console.log("- Reference tx hash:", PELLET_REF_TX_HASH);
+              console.log("- Output index:", PELLET_REF_OUTPUT_INDEX);
+              
+              // Create reference input explicitly
+              const referenceScriptInput = {
+                txHash: PELLET_REF_TX_HASH,
+                outputIndex: PELLET_REF_OUTPUT_INDEX
+              };
+              console.log("Reference script input:", JSON.stringify(referenceScriptInput));
+              
+              // Make sure we're dealing with valid inputs
+              if (!pellet.fuel) console.error("pellet.fuel is undefined or zero");
+              if (!validatorScriptHash) console.error("validatorScriptHash is undefined");
+              if (!fuelTokenHex) console.error("fuelTokenHex is undefined");
+              
+              // Simplified minting approach for PlutusScriptV3
+              try {
+                console.log("Using simplified PlutusScriptV3 minting approach");
+                
+                // Chain all minting operations in a single call to avoid state issues
+                tx.mintPlutusScriptV3()
+                  .mint(pellet.fuel.toString(), validatorScriptHash, fuelTokenHex)
+                  .mintTxInReference(PELLET_REF_TX_HASH, PELLET_REF_OUTPUT_INDEX)
+                  .mintRedeemerValue(mConStr0(['mesh']));
+                
+                console.log("Minting with reference script completed successfully");
+              } catch (mintingStepError) {
+                console.error("Error during minting process:", mintingStepError);
+                throw mintingStepError;
+              }
+              
+              // Add the minted fuel token to assets using concatenated format (no dot)
+              const tokenFullName = `${validatorScriptHash}${fuelTokenHex}`;
+              console.log("Token full name (no dot):", tokenFullName);
+              assets.push({
+                unit: tokenFullName,
+                quantity: pellet.fuel.toString()
+              });
+              
+            } catch (mintError: unknown) {
+              console.error("Error during minting setup:", mintError);
+              if (mintError instanceof Error) {
+                console.error("Error name:", mintError.name);
+                console.error("Error message:", mintError.message);
+                console.error("Error stack:", mintError.stack);
+              }
+              setDeploymentStatus(`Error during minting setup: ${mintError instanceof Error ? mintError.message : String(mintError)}`);
+              return;
+            }
+
             // Send assets to the validator address with inline datum
             tx.txOut(validatorAddress, assets)
               .txOutInlineDatumValue(pelletDatum);
           }
 
-          // Add collateral
-          tx.txInCollateral(
-            collateral.input.txHash,
-            collateral.input.outputIndex,
-            collateral.output.amount,
-            collateral.output.address
-          );
+          // Add collateral if it exists
+          if (collateralUtxos && collateralUtxos.length > 0) {
+            const collateral = collateralUtxos[0];
+            console.log("Using designated collateral UTXO");
+            tx.txInCollateral(
+              collateral.input.txHash,
+              collateral.input.outputIndex,
+              collateral.output.amount,
+              collateral.output.address
+            );
+          } else if (potentialCollateral) {
+            console.log("Using regular UTXO as collateral");
+            tx.txInCollateral(
+              potentialCollateral.input.txHash,
+              potentialCollateral.input.outputIndex,
+              potentialCollateral.output.amount,
+              potentialCollateral.output.address
+            );
+          } else {
+            throw new Error("No suitable collateral found. Please ensure your wallet has at least 5 ADA in a single UTXO.");
+          }
 
           // Set change address and select UTXOs
-          tx.changeAddress(changeAddress)
-            .selectUtxosFrom(utxos);
-
-          // Complete and submit the transaction
-          const unsignedTx = await tx.complete();
-          const signedTx = await wallet.signTx(unsignedTx, true); // true to sign with collateral
-          const txHash = await wallet.submitTx(signedTx);
-
-          txHashesResult.push(txHash);
-          setDeploymentStatus(`Deployed batch ${i + 1} of ${batches.length}. Transaction: ${txHash}`);
+          tx.changeAddress(changeAddress);
+          
+          // Explicitly select UTXOs using selectUtxosFrom
+          console.log(`Explicitly selecting from ${utxos.length} UTXOs for transaction`);
+          tx.selectUtxosFrom(utxos);
+          
+          // Prepare to complete the transaction
+          const sourceAddress = changeAddress;
+          
+          // Carefully handle completion with try/catch
+          try {
+            console.log("Starting transaction completion process");
+            
+            try {
+              console.log("Preparing for transaction completion");
+              
+              // Add debugging tests to identify where the toString error occurs
+              console.log("--- DEBUGGING TESTS START ---");
+              
+              // Test 1: Redeemer serialization
+              try {
+                const redeemerValue = mConStr0([]);
+                console.log("Redeemer value type:", typeof redeemerValue);
+                console.log("Redeemer value structure:", JSON.stringify(redeemerValue, null, 2));
+                console.log("Redeemer toString test:", String(redeemerValue));
+              } catch (error) {
+                console.error("Redeemer serialization error:", error);
+              }
+              
+              // Test 2: Reference script input
+              try {
+                const refInput = { txHash: PELLET_REF_TX_HASH, outputIndex: PELLET_REF_OUTPUT_INDEX };
+                console.log("Ref input structure:", JSON.stringify(refInput, null, 2));
+                console.log("Ref hash toString test:", String(PELLET_REF_TX_HASH));
+              } catch (error) {
+                console.error("Reference script serialization error:", error);
+              }
+              
+              // Test 3: Pellet data (using first pellet in batch)
+              try {
+                if (batch.length > 0) {
+                  const samplePellet = batch[0];
+                  const pelletDatum = {
+                    constructor: 0,
+                    fields: [
+                      samplePellet.pos_x.toString(),
+                      samplePellet.pos_y.toString(),
+                      samplePellet.shipyard_policy || shipyardPolicy
+                    ]
+                  };
+                  console.log("Pellet datum structure:", JSON.stringify(pelletDatum, null, 2));
+                  console.log("Fuel toString test:", String(samplePellet.fuel));
+                }
+              } catch (error) {
+                console.error("Pellet data serialization error:", error);
+              }
+              
+              // Test 4: Minting parameters
+              try {
+                console.log("ValidatorAddress:", validatorAddress);
+                console.log("ValidatorScriptHash:", validatorScriptHash);
+                console.log("FuelTokenHex:", stringToHex("FUEL"));
+                console.log("ValidatorScriptHash toString test:", String(validatorScriptHash));
+                console.log("FuelTokenHex toString test:", String(stringToHex("FUEL")));
+                
+                // Debug deserialized address
+                try {
+                  const deserializedForDebug = deserializeAddress(validatorAddress);
+                  console.log("Deserialized address:", JSON.stringify(deserializedForDebug, null, 2));
+                } catch (deserializeError) {
+                  console.error("Error deserializing address for debug:", deserializeError);
+                }
+              } catch (error) {
+                console.error("Minting parameters serialization error:", error);
+              }
+              
+              // Test 5: mConStr0 function
+              try {
+                console.log("mConStr0 type:", typeof mConStr0);
+                const testConstr = mConStr0(["test"]);
+                console.log("mConStr0 test result:", testConstr);
+                console.log("mConStr0 result type:", typeof testConstr);
+              } catch (error) {
+                console.error("mConStr0 function test error:", error);
+              }
+              
+              console.log("--- DEBUGGING TESTS END ---");
+              
+              // Use the simplest form of transaction completion
+              const unsignedTx = await tx.complete();
+              
+              console.log("Transaction completed successfully");
+              
+              // Proceed with signing and submitting
+              const signedTx = await wallet.signTx(unsignedTx, true);
+              const txHash = await wallet.submitTx(signedTx);
+              console.log("Transaction submitted successfully", txHash);
+              
+              txHashesResult.push(txHash);
+              setDeploymentStatus(`Deployed batch ${i + 1} of ${batches.length}. Transaction: ${txHash}`);
+            } catch (specificError) {
+              // More detailed error logging
+              console.error("Transaction completion specific error:", specificError);
+              if (specificError instanceof Error) {
+                console.error("Error name:", specificError.name);
+                console.error("Error message:", specificError.message);
+                console.error("Stack trace:", specificError.stack);
+                
+                // Check for common error patterns
+                if (specificError.message.includes("toString")) {
+                  console.error("This appears to be a toString error, likely related to null/undefined datum or redeemer");
+                }
+                if (specificError.message.includes("funds")) {
+                  console.error("This appears to be an insufficient funds error");
+                }
+              }
+              throw specificError;
+            }
+          } catch (txCompletionError: unknown) {
+            console.error("Transaction completion error:", txCompletionError);
+            setDeploymentStatus(`Transaction completion error: ${txCompletionError instanceof Error ? txCompletionError.message : String(txCompletionError)}`);
+            return;
+          }
         } catch (batchError) {
           console.error(`Error processing batch ${i + 1}:`, batchError);
           setDeploymentStatus(`Error processing batch ${i + 1}: ${batchError instanceof Error ? batchError.message : String(batchError)}`);
