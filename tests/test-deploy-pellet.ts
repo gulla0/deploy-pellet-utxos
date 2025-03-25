@@ -1,4 +1,5 @@
 import { MeshTxBuilder, BlockfrostProvider, Asset, stringToHex, deserializeAddress, mConStr0 } from "@meshsdk/core";
+import { AppWallet, UTxO } from "@meshsdk/core";
 
 // Replace this with your actual API key or read from environment
 const BLOCKFROST_API_KEY = process.env.BLOCKFROST_API_KEY || 'YOUR_BLOCKFROST_API_KEY_HERE';
@@ -12,8 +13,12 @@ const SHIPYARD_POLICY = 'a6c2c9684eab662549c6417aea6724b238591e38cdddaabd43086ef
 const PELLET_REF_TX_HASH = 'd2aad1327c66dc18ef0e31755195dce708dd13ceb22ff5e7350662512cee983f';
 const PELLET_REF_OUTPUT_INDEX = 0;
 
-// Dummy change address for testing
-const DUMMY_CHANGE_ADDRESS = 'addr_test1qpkm28ylwmxrh73mv0g4kna0frsr7planet83uz8ht4rhqxrrkn9mwl0zqdl83s9s5aqpwpjlhj00ts3fqkt70zfk3nqjr03l2';
+// Get wallet seed from environment
+const WALLET_SEED = process.env.WALLET_SEED || '';
+if (!WALLET_SEED) {
+  console.error("Error: WALLET_SEED environment variable is not set");
+  process.exit(1);
+}
 
 // Test pellet data
 const testPellet = {
@@ -50,6 +55,22 @@ async function testDeployPellet() {
   console.log("Starting pellet deployment test");
   
   try {
+    // Initialize wallet
+    console.log("Initializing wallet...");
+    const wallet = new AppWallet({
+      networkId: 0, // 0 for testnet, 1 for mainnet
+      fetcher: new BlockfrostProvider(BLOCKFROST_API_KEY),
+      submitter: new BlockfrostProvider(BLOCKFROST_API_KEY),
+      key: {
+        type: "mnemonic",
+        words: WALLET_SEED.split(' ')
+      },
+    });
+
+    // Get wallet address
+    const walletAddr = await wallet.getPaymentAddress();
+    console.log(`Wallet address: ${walletAddr}`);
+
     // Create the transaction builder
     const tx = new MeshTxBuilder({
       fetcher: new BlockfrostProvider(BLOCKFROST_API_KEY),
@@ -99,7 +120,7 @@ async function testDeployPellet() {
     tx.mintPlutusScriptV3()
       .mint(testPellet.fuel.toString(), validatorScriptHash, fuelTokenHex)
       .mintTxInReference(PELLET_REF_TX_HASH, PELLET_REF_OUTPUT_INDEX)
-      .mintRedeemerValue(mConStr0(['mesh']));
+      .mintRedeemerValue(mConStr0(['FUEL']));
     
     console.log("Minting with reference script configured");
     
@@ -117,33 +138,157 @@ async function testDeployPellet() {
     
     console.log("Output added to transaction");
     
-    // Set change address
-    tx.changeAddress(DUMMY_CHANGE_ADDRESS);
-    console.log("Change address set");
+    // Set change address to wallet's address
+    const changeAddress = await wallet.getPaymentAddress(); // Use getPaymentAddress instead of getChangeAddress
+    tx.changeAddress(changeAddress);
+    console.log(`Change address set to: ${changeAddress}`);
     
-    // NOTE: In a real test, you would need to:
-    // 1. Add input UTXOs with tx.txIn() 
-    // 2. Add collateral with tx.txInCollateral()
-    // These require actual wallet UTXOs
+    // Get UTXOs from wallet
+    console.log("Fetching wallet UTXOs...");
+    // Custom function to get UTXOs since AppWallet doesn't have getUtxos directly
+    const utxos = await getWalletUtxos(wallet);
+    console.log(`Retrieved ${utxos.length} UTXOs from wallet`);
     
-    console.log("Transaction built and ready. To execute this for real, you would need:");
-    console.log("1. Actual wallet UTXOs as inputs");
-    console.log("2. Collateral UTXO");
-    console.log("3. Actual wallet instance to sign and submit");
+    if (utxos.length === 0) {
+      throw new Error("No UTXOs found in wallet. Please ensure your wallet has ADA.");
+    }
     
-    // FOR ACTUAL EXECUTION:
-    // const unsignedTx = await tx.complete();
-    // const signedTx = await wallet.signTx(unsignedTx);
-    // const txHash = await wallet.submitTx(signedTx);
-    // console.log("Transaction submitted with hash:", txHash);
+    // Select UTXOs for the transaction
+    tx.selectUtxosFrom(utxos);
+    console.log("UTXOs selected for transaction");
     
-    console.log("Test completed successfully");
+    // Add collateral
+    console.log("Finding suitable collateral...");
+    // Find a UTXO with enough ADA to use as collateral
+    const potentialCollateral = utxos.find((utxo: UTxO) => {
+      const lovelaceAmount = utxo.output.amount.find((a: Asset) => a.unit === 'lovelace');
+      return lovelaceAmount && BigInt(lovelaceAmount.quantity) >= BigInt(5000000); // 5 ADA
+    });
+    
+    if (potentialCollateral) {
+      console.log("Using UTXO as collateral:", 
+        potentialCollateral.input.txHash.slice(0, 10) + "...",
+        potentialCollateral.input.outputIndex);
+      tx.txInCollateral(
+        potentialCollateral.input.txHash,
+        potentialCollateral.input.outputIndex,
+        potentialCollateral.output.amount,
+        potentialCollateral.output.address
+      );
+    } else {
+      throw new Error("No suitable collateral found. Please ensure your wallet has at least 5 ADA in a single UTXO.");
+    }
+    
+    // Complete the transaction
+    console.log("Building transaction...");
+    let unsignedTx;
+    try {
+      unsignedTx = await tx.complete();
+      console.log("Transaction built successfully");
+    } catch (buildError) {
+      console.error("Transaction build failed:", buildError);
+      
+      // More detailed error analysis
+      if (buildError instanceof Error) {
+        console.error("Error message:", buildError.message);
+        console.error("Error stack:", buildError.stack);
+        
+        if (buildError.message.includes("INPUTS_EXHAUSTED")) {
+          console.error("INPUTS_EXHAUSTED error: You don't have enough ADA or tokens to complete this transaction");
+        } else if (buildError.message.includes("MAX_TX_SIZE")) {
+          console.error("MAX_TX_SIZE error: Transaction is too large");
+        } else if (buildError.message.includes("MIN_UTXO_VALUE")) {
+          console.error("MIN_UTXO_VALUE error: Output amount is below minimum UTXO value");
+        }
+      }
+      
+      throw new Error(`Failed to build transaction: ${buildError instanceof Error ? buildError.message : String(buildError)}`);
+    }
+    
+    // Sign the transaction
+    console.log("Signing transaction...");
+    let signedTx;
+    try {
+      signedTx = await wallet.signTx(unsignedTx);
+      console.log("Transaction signed successfully");
+    } catch (signError) {
+      console.error("Transaction signing failed:", signError);
+      throw new Error(`Failed to sign transaction: ${signError instanceof Error ? signError.message : String(signError)}`);
+    }
+    
+    // Submit the transaction
+    console.log("Submitting transaction...");
+    let txHash;
+    try {
+      txHash = await wallet.submitTx(signedTx);
+      console.log("Transaction submitted successfully");
+      console.log("Transaction hash:", txHash);
+    } catch (submitError) {
+      console.error("Transaction submission failed:", submitError);
+      
+      // More detailed error analysis
+      if (submitError instanceof Error) {
+        console.error("Error message:", submitError.message);
+        console.error("Error stack:", submitError.stack);
+        
+        if (submitError.message.includes("BadInputsUTxO")) {
+          console.error("BadInputsUTxO error: One of the UTXOs has been spent already");
+        } else if (submitError.message.includes("ScriptWitnessNotValidatingUTXOW")) {
+          console.error("ScriptWitnessNotValidatingUTXOW error: Script validation failed");
+        } else if (submitError.message.includes("OutsideValidityIntervalUTxO")) {
+          console.error("OutsideValidityIntervalUTxO error: Transaction is outside validity interval");
+        }
+      }
+      
+      throw new Error(`Failed to submit transaction: ${submitError instanceof Error ? submitError.message : String(submitError)}`);
+    }
+    
+    console.log("Test completed successfully with transaction hash:", txHash);
+    return txHash;
+    
   } catch (error) {
-    console.error("Test failed:", error);
+    console.error("====== TEST FAILED ======");
+    console.error("Error details:", error);
+    
+    if (error instanceof Error) {
+      console.error("Error name:", error.name);
+      console.error("Error message:", error.message);
+      console.error("Error stack:", error.stack);
+    }
+    
+    // Re-throw to ensure the process exits with an error code
+    throw error;
   }
 }
 
-// Run the test
-testDeployPellet();
+/**
+ * Helper function to get UTXOs from wallet
+ */
+async function getWalletUtxos(wallet: AppWallet): Promise<UTxO[]> {
+  // Get wallet address
+  const address = await wallet.getPaymentAddress();
+  
+  // Create a new provider with the same API key
+  const provider = new BlockfrostProvider(BLOCKFROST_API_KEY);
+  
+  // Fetch UTXOs for address
+  return await provider.fetchAddressUTxOs(address);
+}
+
+// Run the test and handle any errors
+testDeployPellet()
+  .then(txHash => {
+    console.log("");
+    console.log("====== TEST SUCCEEDED ======");
+    console.log("Transaction hash:", txHash);
+    console.log("View on Cardanoscan (preprod):", `https://preprod.cardanoscan.io/transaction/${txHash}`);
+    process.exit(0);
+  })
+  .catch(error => {
+    console.error("");
+    console.error("====== TEST FAILED ======");
+    console.error("Error:", error);
+    process.exit(1);
+  });
   
   
