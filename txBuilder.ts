@@ -30,3 +30,22 @@ txBuilder
     .changeAddress(changeAddress)
     .selectUtxosFrom(utxos)
     .complete();
+
+
+Test deploy pellet TX:
+
+tx.mintPlutusScriptV3()
+      .mint(testPellet.fuel.toString(), validatorScriptHash, fuelTokenHex)
+      .mintTxInReference(PELLET_REF_TX_HASH, PELLET_REF_OUTPUT_INDEX)
+      .mintRedeemerValue(mConStr0(['FUEL']))
+      .txOut(VALIDATOR_ADDRESS, assets)
+      .txOutInlineDatumValue(pelletDatum)
+      .changeAddress(changeAddress)
+      .selectUtxosFrom(utxos)
+      .txInCollateral(
+        potentialCollateral.input.txHash,
+        potentialCollateral.input.outputIndex,
+        potentialCollateral.output.amount,
+        potentialCollateral.output.address
+      )
+      .complete();

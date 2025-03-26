@@ -143,7 +143,7 @@ export default function PelletTest() {
       
       // Simplified minting approach for PlutusScriptV3
       tx.mintPlutusScriptV3()
-        .mint(pellet.fuel, validatorScriptHash, fuelTokenHex)
+        .mint(pellet.fuel, validatorScriptHash, fuelTokenHex) 
         .mintTxInReference(PELLET_REF_TX_HASH, PELLET_REF_OUTPUT_INDEX)
         .mintRedeemerValue(mConStr0(['FUEL']));
       

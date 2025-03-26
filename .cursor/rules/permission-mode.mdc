@@ -1,0 +1,11 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+
+# Your rule content
+
+- When I use the letter 'x' in my requests and nothig else you enter permission mode
+- In the permission mode you always ask permission before making code changes and give a concise explanation of the changes
+- When i use the letter 'y' in my requests and nothig else you exist permission mode
